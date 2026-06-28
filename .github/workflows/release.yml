@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# COPY THIS FILE INTO THE PUBLIC REPO:
+#   AXON-APP2026/MANDEM-AI-releases  →  .github/workflows/release.yml
+#
+# It does NOT run from here (it lives outside .github/workflows/ in the private
+# repo on purpose). Public repos get FREE, unlimited GitHub Actions — including
+# macOS, which bills 10× on private repos — on a quota separate from the private
+# repo's. So release CI moves here while the private source stays private.
+#
+# Required in the PUBLIC repo (Settings → Secrets and variables → Actions):
+#   Secrets:
+#     SOURCE_TOKEN                 PAT with `contents: read` on AXON-APP2026/MANDEM-AI
+#     APPLE_CERTIFICATE_BASE64     base64 of the Developer ID .p12
+#     APPLE_CERTIFICATE_PASSWORD   password for that .p12
+#     APPLE_ID                     Apple ID email (notarisation)
+#     APPLE_APP_SPECIFIC_PASSWORD  app-specific password (notarisation)
+#     APPLE_TEAM_ID                Apple Developer Team ID
+#     (GITHUB_TOKEN is automatic — no need to create it.)
+#   Variables:
+#     VITE_HUB_URL, VITE_HELP_URL, VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_CLIENT_SECRET
+#     (optional) VITE_GMAIL_READONLY
+# ─────────────────────────────────────────────────────────────────────────────
+name: Release installers
+
+# Triggers are dispatch + version tags ONLY. NEVER pull_request: this is a public
+# repo, and a fork PR must never be able to reach the signing/notarisation secrets.
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release in THIS repo
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Pull the PRIVATE application source into the workspace. SOURCE_TOKEN is a
+      # PAT with read access to AXON-APP2026/MANDEM-AI. We pin ref: main.
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: AXON-APP2026/MANDEM-AI
+          ref: main
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Import Apple certificate (macOS only)
+        if: matrix.os == 'macos-latest'
+        run: |
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          echo "CSC_LINK=$RUNNER_TEMP/cert.p12" >> $GITHUB_ENV
+          echo "CSC_KEY_PASSWORD=$APPLE_CERTIFICATE_PASSWORD" >> $GITHUB_ENV
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build renderer + desktop installer (and publish)
+        run: npm run dist -- --publish always
+        env:
+          # Same-repo publish now: the automatic GITHUB_TOKEN can create releases
+          # in THIS public repo (contents: write above). electron-builder reads the
+          # target owner/repo from package.json `publish` (AXON-APP2026/MANDEM-AI-releases),
+          # which is exactly this repo.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code-signing + notarisation (no-op on Windows).
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Renderer build vars (repo Variables — not secrets).
+          VITE_HUB_URL: ${{ vars.VITE_HUB_URL }}
+          VITE_HELP_URL: ${{ vars.VITE_HELP_URL }}
+          VITE_GOOGLE_CLIENT_ID: ${{ vars.VITE_GOOGLE_CLIENT_ID }}
+          VITE_GOOGLE_CLIENT_SECRET: ${{ vars.VITE_GOOGLE_CLIENT_SECRET }}
+          VITE_GMAIL_READONLY: ${{ vars.VITE_GMAIL_READONLY }}
