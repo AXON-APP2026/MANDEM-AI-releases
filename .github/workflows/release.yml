@@ -25,7 +25,11 @@ name: Release installers
 # Triggers are dispatch + version tags ONLY. NEVER pull_request: this is a public
 # repo, and a fork PR must never be able to reach the signing/notarisation secrets.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Exact tag to build (e.g. v0.6.47)"
+        required: true
   push:
     tags:
       - "v*"
@@ -40,13 +44,13 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      # Pull the PRIVATE application source into the workspace. SOURCE_TOKEN is a
-      # PAT with read access to AXON-APP2026/MANDEM-AI. We pin ref: main.
+      # Pull the PRIVATE application source at the EXACT TAG being released.
+      # Never a moving branch: the tag you pass in is what gets built.
       - name: Checkout private source
         uses: actions/checkout@v4
         with:
           repository: AXON-APP2026/MANDEM-AI
-          ref: main
+          ref: ${{ inputs.ref || github.ref_name }}
           token: ${{ secrets.SOURCE_TOKEN }}
 
       - uses: actions/setup-node@v4
@@ -56,6 +60,18 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Fail closed if the tag and package.json disagree — an installer can
+      # never again ship with a version different from its tag.
+      - name: Verify the checkout matches the tag
+        shell: bash
+        run: |
+          want="${{ inputs.ref || github.ref_name }}"; want="${want#v}"
+          have="$(node -p "require('./package.json').version")"
+          if [ "$want" != "$have" ]; then
+            echo "::error::Tag v$want but package.json says $have — refusing to build."
+            exit 1
+          fi
 
       - name: Import Apple certificate (macOS only)
         if: matrix.os == 'macos-latest'
