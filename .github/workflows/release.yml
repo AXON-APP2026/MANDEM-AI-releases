@@ -17,7 +17,7 @@
 #     APPLE_TEAM_ID                Apple Developer Team ID
 #     (GITHUB_TOKEN is automatic — no need to create it.)
 #   Variables:
-#     VITE_HUB_URL, VITE_HELP_URL, VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_CLIENT_SECRET
+#     VITE_HUB_URL, VITE_HELP_URL, VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_CLIENT_SECRET, VITE_MS_CLIENT_ID
 #     (optional) VITE_GMAIL_READONLY
 # ─────────────────────────────────────────────────────────────────────────────
 name: Release installers
