@@ -46,11 +46,17 @@ jobs:
     steps:
       # Pull the PRIVATE application source at the EXACT TAG being released.
       # Never a moving branch: the tag you pass in is what gets built.
+      #
+      # ref MUST be fully qualified (refs/tags/...). A bare string like "v0.8.60"
+      # is ambiguous to actions/checkout — it can't tell branch from tag, so it
+      # builds BOTH a branch-wildcard and a tag-wildcard fetch refspec for the
+      # same string, and if only one (or neither) matches, checkout fails before
+      # the build even starts. github.ref is already fully qualified on a tag push.
       - name: Checkout private source
         uses: actions/checkout@v4
         with:
           repository: AXON-APP2026/MANDEM-AI
-          ref: ${{ inputs.ref || github.ref_name }}
+          ref: ${{ inputs.ref && format('refs/tags/{0}', inputs.ref) || github.ref }}
           token: ${{ secrets.SOURCE_TOKEN }}
 
       - uses: actions/setup-node@v4
