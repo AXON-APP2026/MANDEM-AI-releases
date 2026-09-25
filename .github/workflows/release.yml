@@ -7,6 +7,13 @@
 # macOS, which bills 10× on private repos — on a quota separate from the private
 # repo's. So release CI moves here while the private source stays private.
 #
+# THIS FILE MUST STAY IN LOCKSTEP WITH .github/workflows/release.yml IN THIS
+# REPO (the private "aligned reference" copy) — same Node pin (.nvmrc /
+# package.json engines.node), same cache/retry strategy, same step order. When
+# one changes for a toolchain/reliability reason, copy the change into the
+# other by hand and re-paste this file into the public repo. See
+# docs/RELEASE-CI.md for the full rationale and the local Windows repro steps.
+#
 # Required in the PUBLIC repo (Settings → Secrets and variables → Actions):
 #   Secrets:
 #     SOURCE_TOKEN                 PAT with `contents: read` on AXON-APP2026/MANDEM-AI
@@ -17,19 +24,15 @@
 #     APPLE_TEAM_ID                Apple Developer Team ID
 #     (GITHUB_TOKEN is automatic — no need to create it.)
 #   Variables:
-#     VITE_HUB_URL, VITE_HELP_URL, VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_CLIENT_SECRET, VITE_MS_CLIENT_ID
-#     (optional) VITE_GMAIL_READONLY
+#     VITE_HUB_URL, VITE_HELP_URL, VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_CLIENT_SECRET
+#     (optional) VITE_GMAIL_READONLY, VITE_MS_CLIENT_ID
 # ─────────────────────────────────────────────────────────────────────────────
 name: Release installers
 
 # Triggers are dispatch + version tags ONLY. NEVER pull_request: this is a public
 # repo, and a fork PR must never be able to reach the signing/notarisation secrets.
 on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Exact tag to build (e.g. v0.6.47)"
-        required: true
+  workflow_dispatch: {}
   push:
     tags:
       - "v*"
@@ -40,44 +43,221 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Explicit + bounded, never infinite. These govern npm's OWN registry
+      # fetches (package metadata + tarballs) — Electron's binary download is a
+      # separate HTTP request the `electron` package's postinstall makes via
+      # @electron/get, which doesn't read these; that download is made reliable
+      # instead by caching (below) plus retrying the whole `npm ci` on failure.
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      NPM_CONFIG_FETCH_RETRIES: "5"
+      NPM_CONFIG_FETCH_RETRY_FACTOR: "2"
+      NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "15000"
+      NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "120000"
+      NPM_CONFIG_FETCH_TIMEOUT: "300000"
+      # Fixed, OS-agnostic-in-YAML cache locations for the Electron binary
+      # download (`electron` package postinstall) and electron-builder's own
+      # auxiliary tool downloads (nsis, winCodeSign, etc.). runner.temp already
+      # resolves to a real per-OS writable path (incl. Windows), so no manual
+      # per-OS branching is needed here — only the cache step below needs to
+      # know the OS, for the cache key.
+      ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
+      ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
     steps:
-      # Pull the PRIVATE application source at the EXACT TAG being released.
-      # Never a moving branch: the tag you pass in is what gets built.
-      #
-      # ref MUST be fully qualified (refs/tags/...). A bare string like "v0.8.60"
-      # is ambiguous to actions/checkout — it can't tell branch from tag, so it
-      # builds BOTH a branch-wildcard and a tag-wildcard fetch refspec for the
-      # same string, and if only one (or neither) matches, checkout fails before
-      # the build even starts. github.ref is already fully qualified on a tag push.
+      # Pull the PRIVATE application source into the workspace. SOURCE_TOKEN is a
+      # PAT with read access to AXON-APP2026/MANDEM-AI. We pin ref: main.
       - name: Checkout private source
         uses: actions/checkout@v4
         with:
           repository: AXON-APP2026/MANDEM-AI
-          ref: ${{ inputs.ref && format('refs/tags/{0}', inputs.ref) || github.ref }}
+          ref: main
           token: ${{ secrets.SOURCE_TOKEN }}
 
+      # Single source of truth for the pinned toolchain version — .nvmrc, also
+      # used by local `nvm use`. package.json's engines.node (checked below)
+      # must describe the same floor; keep the two reconciled by hand (they
+      # rarely change — only when the pdfjs-dist/Electron Node requirement does).
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: ".nvmrc"
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
-      # Fail closed if the tag and package.json disagree — an installer can
-      # never again ship with a version different from its tag.
-      - name: Verify the checkout matches the tag
+      - name: Print runtime diagnostics (no secrets)
         shell: bash
         run: |
-          want="${{ inputs.ref || github.ref_name }}"; want="${want#v}"
+          echo "Node version:   $(node --version)"
+          echo "npm version:    $(npm --version)"
+          echo "npm registry:   $(npm config get registry)"
+          echo "npm cache dir:  $(npm config get cache)"
+          echo "Runner:         ${{ runner.os }}/${{ runner.arch }}"
+
+      # ── ENGINE GUARD — fail fast, before any install/network activity ───────
+      # pdfjs-dist@6.1.200 (and any future dependency with the same floor)
+      # requires Node >=22.13.0. A bad pin here must be caught immediately with
+      # a plain-English message, not surfaced later as a confusing install
+      # failure three steps downstream.
+      - name: Enforce pinned Node engine (fail fast, before install)
+        shell: bash
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const wanted = pkg.engines && pkg.engines.node;
+            if (!wanted) { console.error("::error::package.json is missing engines.node - cannot verify the runner Node version."); process.exit(1); }
+            const m = wanted.match(/^>=\s*(\d+)\.(\d+)\.(\d+)\s*<\s*(\d+)\.(\d+)\.(\d+)$/);
+            if (!m) { console.error("::error::Unrecognised engines.node range: " + wanted); process.exit(1); }
+            const [, fMaj, fMin, fPatch, cMaj, cMin, cPatch] = m.map(Number);
+            const [aMaj, aMin, aPatch] = process.version.slice(1).split(".").map(Number);
+            const geFloor = aMaj > fMaj || (aMaj === fMaj && (aMin > fMin || (aMin === fMin && aPatch >= fPatch)));
+            const ltCeil = aMaj < cMaj || (aMaj === cMaj && (aMin < cMin || (aMin === cMin && aPatch < cPatch)));
+            if (!geFloor || !ltCeil) {
+              console.error("::error::Node " + process.version + " does not satisfy engines.node (" + wanted + "). pdfjs-dist@" + pkg.dependencies["pdfjs-dist"] + " requires Node >=22.13.0. Fix the node-version pinned via actions/setup-node (.nvmrc) in this workflow - never loosen engines.node to hide the mismatch.");
+              process.exit(1);
+            }
+            console.log("Node " + process.version + " satisfies engines.node (" + wanted + ").");
+          '
+
+      # ── VERSION GUARD — build from the tag, or don't build ──────────────────
+      # Real drift found and fixed here (13/08): the private release.yml has
+      # this guard; this public mirror didn't, so it could silently publish a
+      # build whose version disagrees with the tag that triggered it. Only
+      # meaningful when triggered by an actual tag push (workflow_dispatch has
+      # no tag to compare against, so it's skipped there) — compares THIS
+      # repo's release tag against the PRIVATE source's package.json version
+      # (already checked out above via SOURCE_TOKEN, pinned to `main`). The
+      # "tagged v0.6.46, installed reports v0.6.47" bug class: never publish a
+      # build that reports a different version than the tag that triggered it.
+      - name: Verify the checkout matches the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          want="${{ github.ref_name }}"; want="${want#v}"
           have="$(node -p "require('./package.json').version")"
-          if [ "$want" != "$have" ]; then
-            echo "::error::Tag v$want but package.json says $have — refusing to build."
+          echo "tag=${want} package.json=${have}"
+          if [ "${want}" != "${have}" ]; then
+            echo "::error::Refusing to build: tag v${want} but the private repo's package.json (main) is ${have}. Merge + version-bump the private repo to match first, then push this repo's matching tag — never publish a build that reports a different version than its tag."
             exit 1
           fi
+
+      - name: Resolve pinned Electron version (cache key)
+        id: electron-version
+        shell: bash
+        run: |
+          v="$(node -p "require('./package-lock.json').packages['node_modules/electron'].version")"
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "Pinned Electron version (from package-lock.json): ${v}"
+
+      # Cache the Electron binary + electron-builder's own auxiliary downloads
+      # (nsis, winCodeSign, etc.) so a warm run never touches the network for
+      # them at all — the socket-hang-up failure mode can only happen on an
+      # actual download, so the best fix for it is not needing one. Key on
+      # OS + arch + the exact pinned Electron version + the lockfile hash, so a
+      # dependency bump or an Electron version bump both invalidate cleanly
+      # instead of serving a stale/mismatched binary.
+      - name: Restore Electron + electron-builder download cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ELECTRON_CACHE }}
+            ${{ env.ELECTRON_BUILDER_CACHE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-electron-${{ steps.electron-version.outputs.version }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-electron-${{ steps.electron-version.outputs.version }}-
+            ${{ runner.os }}-${{ runner.arch }}-electron-
+
+      # ── INSTALL — npm ci only, scripts + engine checks run for real ─────────
+      # No --ignore-scripts (Electron's postinstall download must run — the
+      # packaged app needs the real binary), no --ignore-engines, no --force,
+      # no falling back to `npm install`. Retried a BOUNDED number of times
+      # (never infinite) with increasing backoff: a transient socket hang-up
+      # downloading the Electron binary is very likely to succeed on a second
+      # attempt, especially now that a warm cache means most attempts need no
+      # download at all. npm ci always deletes and recreates node_modules
+      # itself before installing (this is npm's own documented, safe behaviour,
+      # not a workaround we add) — the EPERM warnings historically seen here
+      # are the OS still releasing file handles from the PREVIOUS interrupted
+      # attempt's crashed download/antivirus scan; the backoff sleep between
+      # attempts gives Windows time to release those handles before npm ci's
+      # own cleanup runs again. We never manually delete node_modules or any
+      # other path ourselves.
+      - name: Install dependencies (npm ci, bounded retries)
+        id: install
+        shell: bash
+        run: |
+          set -uo pipefail
+          max_attempts=3
+          attempt=1
+          until npm ci; do
+            code=$?
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::npm ci failed after ${attempt} attempt(s) (exit ${code}). See the log above for the exact failing package/command."
+              exit "$code"
+            fi
+            wait_s=$((attempt * 20))
+            echo "::warning::npm ci attempt ${attempt} failed (exit ${code}) — retrying in ${wait_s}s (bounded: ${max_attempts} attempts total, never infinite)."
+            sleep "$wait_s"
+            attempt=$((attempt + 1))
+          done
+          echo "npm ci succeeded on attempt ${attempt}."
+
+      # Only runs if install exhausted its retries — attributes the failure
+      # instead of leaving "npm error code 1" to be misread as a source bug.
+      - name: Diagnose install failure (network attribution, no secrets)
+        if: failure() && steps.install.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::group::Network + registry diagnostics"
+          echo "npm registry config: $(npm config get registry)"
+          node -e "require('dns').lookup('registry.npmjs.org', (e,a)=>console.log('DNS registry.npmjs.org ->', e ? e.message : a))"
+          node -e "require('dns').lookup('github.com', (e,a)=>console.log('DNS github.com ->', e ? e.message : a))"
+          npm ping || echo "npm ping to the configured registry failed or timed out (see above)."
+          echo "::endgroup::"
+          echo "::error::npm ci did not complete after retries. This is most likely a NETWORK failure (npm registry, Electron's GitHub-hosted binary download, or GitHub-runner networking) rather than a source-code defect — unless the 'Install dependencies' log above shows a genuine dependency-resolution or lockfile error. Compare the DNS/ping results above against the failing package path in that log to attribute the cause (registry vs. Electron binary vs. DNS/TLS/proxy vs. runner networking)."
+
+      - name: Report resolved dependency versions
+        shell: bash
+        run: npm ls pdfjs-dist electron --depth=0
+
+      # Proves the postinstall download actually completed and produced a
+      # runnable binary — not just that a directory exists. `electron
+      # --version` is Electron's own documented smoke-test invocation: it
+      # prints the version and exits without opening a window, so it's safe
+      # headless on both matrix OSes.
+      - name: Verify Electron installation
+        shell: bash
+        run: |
+          set -e
+          pkg_version="$(node -p "require('./node_modules/electron/package.json').version")"
+          bin_version="$(npx --no-install electron --version | sed 's/^v//')"
+          echo "Electron package.json version: ${pkg_version}"
+          echo "Electron binary reports:       ${bin_version}"
+          if [ "${pkg_version}" != "${bin_version}" ]; then
+            echo "::error::Electron's installed binary (${bin_version}) does not match its package.json version (${pkg_version}) — the postinstall download is stale, partial, or corrupted."
+            exit 1
+          fi
+          node -e "const p = require('./node_modules/pdfjs-dist/package.json'); console.log('pdfjs-dist ' + p.version + ' resolved OK — requires Node ' + p.engines.node + ', running Node ' + process.version + '.');"
+
+      - name: Typecheck
+        shell: bash
+        run: npm run typecheck
+
+      # ── RELEASE GATE — no green, no publish ─────────────────────────────────
+      # Runs the invariant harness against the REAL data layer (read-back
+      # verified) + static source scans. A single failing invariant fails this
+      # step, so the build never reaches the publish step. The report is uploaded
+      # below so the board can be read WITHOUT logs.
+      - name: Verify invariants (release gate)
+        run: npm run verify
+
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-report-${{ matrix.os }}
+          path: VERIFICATION-REPORT.md
 
       - name: Import Apple certificate (macOS only)
         if: matrix.os == 'macos-latest'
@@ -89,22 +269,34 @@ jobs:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
-      - name: Build renderer + desktop installer (and publish)
-        run: npm run dist -- --publish always
+      - name: Build renderer (vite)
+        shell: bash
+        run: npm run build
         env:
-          # Same-repo publish now: the automatic GITHUB_TOKEN can create releases
-          # in THIS public repo (contents: write above). electron-builder reads the
-          # target owner/repo from package.json `publish` (AXON-APP2026/MANDEM-AI-releases),
-          # which is exactly this repo.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS code-signing + notarisation (no-op on Windows).
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # Renderer build vars (repo Variables — not secrets).
           VITE_HUB_URL: ${{ vars.VITE_HUB_URL }}
           VITE_HELP_URL: ${{ vars.VITE_HELP_URL }}
           VITE_GOOGLE_CLIENT_ID: ${{ vars.VITE_GOOGLE_CLIENT_ID }}
           VITE_GOOGLE_CLIENT_SECRET: ${{ vars.VITE_GOOGLE_CLIENT_SECRET }}
           VITE_GMAIL_READONLY: ${{ vars.VITE_GMAIL_READONLY }}
+          # Outlook/Microsoft 365 integration — was missing from this file
+          # (present in the private repo's reference copy only), so a public
+          # release build silently shipped without Outlook configured. Added
+          # to close that drift while realigning the two files.
           VITE_MS_CLIENT_ID: ${{ vars.VITE_MS_CLIENT_ID }}
+
+      # Packaging only, now that verify/typecheck/build each have their own
+      # named step above — a failure here means packaging specifically, not
+      # "something in this multi-command blob broke." Same-repo publish: the
+      # automatic GITHUB_TOKEN can create releases in THIS public repo
+      # (contents: write above). electron-builder reads the target owner/repo
+      # from package.json `publish` (AXON-APP2026/MANDEM-AI-releases), which is
+      # exactly this repo.
+      - name: Package with electron-builder (and publish)
+        shell: bash
+        run: npx electron-builder --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code-signing + notarisation (no-op on Windows).
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
