@@ -29,10 +29,25 @@
 # ─────────────────────────────────────────────────────────────────────────────
 name: Release installers
 
-# Triggers are dispatch + version tags ONLY. NEVER pull_request: this is a public
-# repo, and a fork PR must never be able to reach the signing/notarisation secrets.
+# Source-pinning hardening (25/09/2026 release-provenance sprint) — this
+# workflow now ONLY builds from an explicit, pre-approved private-source
+# commit. workflow_dispatch requires BOTH `ref` (the private MANDEM-AI tag)
+# and `expected_sha` (the exact commit that tag is approved to point at) —
+# GitHub refuses to even start a run missing a required input, so "missing"
+# is already closed off. A plain `git push --tags` to THIS repo has no way
+# to supply expected_sha at all, so it is explicitly refused below rather
+# than silently building an unverified source — never pull_request either:
+# this is a public repo, and a fork PR must never be able to reach the
+# signing/notarisation secrets.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "REQUIRED. Exact private MANDEM-AI source tag to build (e.g. v0.11.2) — must already exist on AXON-APP2026/MANDEM-AI."
+        required: true
+      expected_sha:
+        description: "REQUIRED. The approved full private-source commit SHA (40 hex chars) that tag must resolve to. The build refuses on any mismatch."
+        required: true
   push:
     tags:
       - "v*"
@@ -68,14 +83,47 @@ jobs:
       ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
       ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
     steps:
-      # Pull the PRIVATE application source into the workspace. SOURCE_TOKEN is a
-      # PAT with read access to AXON-APP2026/MANDEM-AI. We pin ref: main.
+      # A plain tag push has no workflow_dispatch inputs, so there is no way
+      # for it to supply expected_sha — refuse it outright rather than ever
+      # building from an unverified/unapproved source. Every real release so
+      # far has been workflow_dispatch anyway (this repo's Actions history
+      # has zero real tag-push-triggered runs), so this closes a path that
+      # was already unused, not one anyone currently relies on.
+      - name: Refuse a plain tag push (cannot supply expected_sha)
+        if: github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          echo "::error::This workflow only builds via workflow_dispatch, supplying BOTH 'ref' (the private MANDEM-AI tag) and 'expected_sha' (the approved commit SHA) so every build is cross-checked against an approved private-source commit. A plain tag push to this repo cannot supply expected_sha and is refused. Trigger from Actions -> Release installers -> Run workflow instead."
+          exit 1
+
+      # Pull the PRIVATE application source AT THE EXACT TAG being released —
+      # never a moving branch. actions/checkout itself fails this step
+      # closed if the tag doesn't exist on the private repo.
       - name: Checkout private source
         uses: actions/checkout@v4
         with:
           repository: AXON-APP2026/MANDEM-AI
-          ref: main
+          ref: ${{ format('refs/tags/{0}', inputs.ref) }}
           token: ${{ secrets.SOURCE_TOKEN }}
+
+      # ── SOURCE-SHA GUARD — the one check nothing else here provides: that
+      # the tag actually resolves to the SPECIFIC commit that was reviewed
+      # and approved, not just to A commit with the right version number in
+      # package.json. Logs the real checked-out SHA (never a secret) either
+      # way, and fails closed on any mismatch — a tag can be moved/re-pointed
+      # after review; this is what catches that.
+      - name: Verify source commit SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          echo "Requested private tag:              ${{ inputs.ref }}"
+          echo "Checked-out private-source commit:  ${actual_sha}"
+          if [ "${actual_sha}" != "${{ inputs.expected_sha }}" ]; then
+            echo "::error::Checked-out commit (${actual_sha}) does not match the approved expected_sha (${{ inputs.expected_sha }}) supplied to this run. The private tag '${{ inputs.ref }}' may have been moved/re-pointed after review, or the wrong SHA was entered. Refusing to build."
+            exit 1
+          fi
+          echo "Verified: checked-out commit matches the approved release SHA."
 
       # Single source of truth for the pinned toolchain version — .nvmrc, also
       # used by local `nvm use`. package.json's engines.node (checked below)
@@ -121,24 +169,20 @@ jobs:
           '
 
       # ── VERSION GUARD — build from the tag, or don't build ──────────────────
-      # Real drift found and fixed here (13/08): the private release.yml has
-      # this guard; this public mirror didn't, so it could silently publish a
-      # build whose version disagrees with the tag that triggered it. Only
-      # meaningful when triggered by an actual tag push (workflow_dispatch has
-      # no tag to compare against, so it's skipped there) — compares THIS
-      # repo's release tag against the PRIVATE source's package.json version
-      # (already checked out above via SOURCE_TOKEN, pinned to `main`). The
-      # "tagged v0.6.46, installed reports v0.6.47" bug class: never publish a
-      # build that reports a different version than the tag that triggered it.
+      # Compares the requested tag's version number against the PRIVATE
+      # source's package.json AT THE EXACT COMMIT SHA-verified above — not
+      # "main", not any moving ref. Runs unconditionally now (workflow_dispatch
+      # is this workflow's ONLY real trigger path — see the tag-push refusal
+      # above — so the old `if: startsWith(github.ref, 'refs/tags/')` guard,
+      # which never once evaluated true in this repo's history, is removed).
       - name: Verify the checkout matches the tag
-        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
-          want="${{ github.ref_name }}"; want="${want#v}"
+          want="${{ inputs.ref }}"; want="${want#v}"
           have="$(node -p "require('./package.json').version")"
           echo "tag=${want} package.json=${have}"
           if [ "${want}" != "${have}" ]; then
-            echo "::error::Refusing to build: tag v${want} but the private repo's package.json (main) is ${have}. Merge + version-bump the private repo to match first, then push this repo's matching tag — never publish a build that reports a different version than its tag."
+            echo "::error::Refusing to build: tag v${want} but the checked-out private source's package.json says ${have}. Refusing to build."
             exit 1
           fi
 
@@ -291,6 +335,15 @@ jobs:
       # (contents: write above). electron-builder reads the target owner/repo
       # from package.json `publish` (AXON-APP2026/MANDEM-AI-releases), which is
       # exactly this repo.
+      #
+      # KNOWN RISK (release-provenance sprint, 25/09/2026) — this step still
+      # publishes PER OS, independently: whichever matrix leg reaches here
+      # and succeeds updates the shared GitHub Release immediately, with no
+      # dependency on the OTHER OS's outcome. This is why v0.11.0 shipped a
+      # Windows-only release when macOS failed at code-signing. A proposed
+      # fix (build both OSes to artifacts, publish once in a separate job
+      # that needs: build) has been reported separately but is NOT applied
+      # here — see the release-provenance report for the exact diff.
       - name: Package with electron-builder (and publish)
         shell: bash
         run: npx electron-builder --publish always
