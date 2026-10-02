@@ -29,31 +29,47 @@
 # ─────────────────────────────────────────────────────────────────────────────
 name: Release installers
 
-# Source-pinning hardening (25/09/2026 release-provenance sprint) — this
-# workflow now ONLY builds from an explicit, pre-approved private-source
-# commit. workflow_dispatch requires BOTH `ref` (the private MANDEM-AI tag)
-# and `expected_sha` (the exact commit that tag is approved to point at) —
-# GitHub refuses to even start a run missing a required input, so "missing"
-# is already closed off. A plain `git push --tags` to THIS repo has no way
-# to supply expected_sha at all, so it is explicitly refused below rather
-# than silently building an unverified source — never pull_request either:
-# this is a public repo, and a fork PR must never be able to reach the
-# signing/notarisation secrets.
+# Release-provenance hardening, round 2 (01/10/2026) — this workflow builds
+# ONLY via workflow_dispatch, supplying THREE required inputs: `ref` (the
+# private MANDEM-AI version tag), `expected_sha` (the exact commit that tag
+# is approved to resolve to), and `dry_run` (defaults true — verify + build
+# only, never sign/notarise/publish). The previous `push: tags: v*` trigger
+# is removed entirely: every tag in this public repo has always pointed at
+# the same static workflow-file commit (never a meaningful source snapshot —
+# see the release-provenance report), a plain tag push has no way to supply
+# expected_sha, and in practice every real build here has already been
+# workflow_dispatch (this repo's Actions history has zero real tag-push
+# builds). Removing the trigger — rather than keeping the step that refused
+# it — removes the confusing zero-job "failure" runs that refusal produced.
+# Never pull_request either: this is a public repo, and a fork PR must never
+# be able to reach the signing/notarisation secrets.
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "REQUIRED. Exact private MANDEM-AI source tag to build (e.g. v0.11.2) — must already exist on AXON-APP2026/MANDEM-AI."
+        description: "REQUIRED. Immutable private MANDEM-AI version tag to build, e.g. v0.11.2 — must already exist on AXON-APP2026/MANDEM-AI. Strict vMAJOR.MINOR.PATCH format only; branch names (including main) are rejected."
         required: true
+        type: string
       expected_sha:
-        description: "REQUIRED. The approved full private-source commit SHA (40 hex chars) that tag must resolve to. The build refuses on any mismatch."
+        description: "REQUIRED. The approved full private-source commit SHA (exactly 40 hex characters, not abbreviated) that tag must resolve to. The build refuses on any mismatch."
         required: true
-  push:
-    tags:
-      - "v*"
+        type: string
+      dry_run:
+        description: "true (default): validate provenance, install, verify, typecheck and build — but never sign, notarise or publish. false: full release path, subject to every guard passing."
+        required: true
+        default: true
+        type: boolean
 
 permissions:
-  contents: write # needed to create the GitHub Release in THIS repo
+  contents: write # needed to create the GitHub Release in THIS repo (real runs only)
+
+# One in-flight run per requested version — a second trigger for the SAME
+# ref queues rather than racing a concurrent publish; a later run never
+# cancels an in-progress one (cancelling mid-publish could leave a release
+# half-updated). Different versions are independent and do not share a lock.
+concurrency:
+  group: release-${{ inputs.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -63,6 +79,17 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
+      # Workflow inputs, bound to env vars ONCE here so every later `run:`
+      # block references $PRIVATE_REF / $EXPECTED_SHA / $DRY_RUN rather than
+      # interpolating ${{ inputs.* }} directly into a shell body (the latter
+      # is the standard GitHub Actions script-injection pattern — this repo
+      # is public, and workflow_dispatch inputs are operator-supplied free
+      # text). `with:` parameters (e.g. the checkout step's `ref:`) are not
+      # shell-interpolated by Actions, so referencing ${{ inputs.ref }}
+      # there directly remains safe and is left as-is.
+      PRIVATE_REF: ${{ inputs.ref }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      DRY_RUN: ${{ inputs.dry_run }}
       # Explicit + bounded, never infinite. These govern npm's OWN registry
       # fetches (package metadata + tarballs) — Electron's binary download is a
       # separate HTTP request the `electron` package's postinstall makes via
@@ -83,27 +110,40 @@ jobs:
       ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
       ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
     steps:
-      # A plain tag push has no workflow_dispatch inputs, so there is no way
-      # for it to supply expected_sha — refuse it outright rather than ever
-      # building from an unverified/unapproved source. Every real release so
-      # far has been workflow_dispatch anyway (this repo's Actions history
-      # has zero real tag-push-triggered runs), so this closes a path that
-      # was already unused, not one anyone currently relies on.
-      - name: Refuse a plain tag push (cannot supply expected_sha)
-        if: github.event_name != 'workflow_dispatch'
+      # ── INPUT VALIDATION — fails closed before anything else runs. A
+      # malformed/abbreviated/branch-like value never reaches checkout.
+      - name: Validate release inputs
         shell: bash
         run: |
-          echo "::error::This workflow only builds via workflow_dispatch, supplying BOTH 'ref' (the private MANDEM-AI tag) and 'expected_sha' (the approved commit SHA) so every build is cross-checked against an approved private-source commit. A plain tag push to this repo cannot supply expected_sha and is refused. Trigger from Actions -> Release installers -> Run workflow instead."
-          exit 1
+          set -euo pipefail
+          if ! [[ "${PRIVATE_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid ref '${PRIVATE_REF}' — must be a strict version tag (vMAJOR.MINOR.PATCH, e.g. v0.11.2). Branch names (including main), paths, and shell metacharacters are all rejected by this exact-match pattern."
+            exit 1
+          fi
+          sha_lc="$(printf '%s' "${EXPECTED_SHA}" | tr '[:upper:]' '[:lower:]')"
+          if ! [[ "${sha_lc}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid expected_sha — must be exactly 40 hexadecimal characters (a full commit SHA, never abbreviated, no whitespace or extra text)."
+            exit 1
+          fi
+          if [ "${DRY_RUN}" != "true" ] && [ "${DRY_RUN}" != "false" ]; then
+            echo "::error::Invalid dry_run value '${DRY_RUN}' — expected true or false."
+            exit 1
+          fi
+          # Normalise the SHA to lowercase for every later comparison.
+          echo "EXPECTED_SHA=${sha_lc}" >> "$GITHUB_ENV"
+          echo "Validated: ref=${PRIVATE_REF} expected_sha=${sha_lc} dry_run=${DRY_RUN}"
 
       # Pull the PRIVATE application source AT THE EXACT TAG being released —
       # never a moving branch. actions/checkout itself fails this step
-      # closed if the tag doesn't exist on the private repo.
+      # closed if the tag doesn't exist on the private repo. (The `with:`
+      # block is not shell-interpolated, so referencing ${{ inputs.ref }}
+      # directly here — already proven to match the strict version pattern
+      # above — is safe.)
       - name: Checkout private source
         uses: actions/checkout@v4
         with:
           repository: AXON-APP2026/MANDEM-AI
-          ref: ${{ format('refs/tags/{0}', inputs.ref) }}
+          ref: refs/tags/${{ inputs.ref }}
           token: ${{ secrets.SOURCE_TOKEN }}
 
       # ── SOURCE-SHA GUARD — the one check nothing else here provides: that
@@ -117,12 +157,13 @@ jobs:
         run: |
           set -euo pipefail
           actual_sha="$(git rev-parse HEAD)"
-          echo "Requested private tag:              ${{ inputs.ref }}"
+          echo "Requested private tag:              ${PRIVATE_REF}"
           echo "Checked-out private-source commit:  ${actual_sha}"
-          if [ "${actual_sha}" != "${{ inputs.expected_sha }}" ]; then
-            echo "::error::Checked-out commit (${actual_sha}) does not match the approved expected_sha (${{ inputs.expected_sha }}) supplied to this run. The private tag '${{ inputs.ref }}' may have been moved/re-pointed after review, or the wrong SHA was entered. Refusing to build."
+          if [ "${actual_sha}" != "${EXPECTED_SHA}" ]; then
+            echo "::error::Checked-out commit (${actual_sha}) does not match the approved expected_sha (${EXPECTED_SHA}) supplied to this run. The private tag '${PRIVATE_REF}' may have been moved/re-pointed after review, or the wrong SHA was entered. Refusing to build."
             exit 1
           fi
+          echo "ACTUAL_SHA=${actual_sha}" >> "$GITHUB_ENV"
           echo "Verified: checked-out commit matches the approved release SHA."
 
       # Single source of truth for the pinned toolchain version — .nvmrc, also
@@ -168,23 +209,22 @@ jobs:
             console.log("Node " + process.version + " satisfies engines.node (" + wanted + ").");
           '
 
-      # ── VERSION GUARD — build from the tag, or don't build ──────────────────
-      # Compares the requested tag's version number against the PRIVATE
-      # source's package.json AT THE EXACT COMMIT SHA-verified above — not
-      # "main", not any moving ref. Runs unconditionally now (workflow_dispatch
-      # is this workflow's ONLY real trigger path — see the tag-push refusal
-      # above — so the old `if: startsWith(github.ref, 'refs/tags/')` guard,
-      # which never once evaluated true in this repo's history, is removed).
+      # ── VERSION GUARD — an ADDITIONAL check, never a substitute for the
+      # SHA guard above. Compares the requested tag's version number against
+      # the PRIVATE source's package.json AT THE EXACT COMMIT SHA-verified
+      # above — not "main", not any moving ref.
       - name: Verify the checkout matches the tag
         shell: bash
         run: |
-          want="${{ inputs.ref }}"; want="${want#v}"
+          set -euo pipefail
+          want="${PRIVATE_REF#v}"
           have="$(node -p "require('./package.json').version")"
           echo "tag=${want} package.json=${have}"
           if [ "${want}" != "${have}" ]; then
             echo "::error::Refusing to build: tag v${want} but the checked-out private source's package.json says ${have}. Refusing to build."
             exit 1
           fi
+          echo "APP_VERSION=${have}" >> "$GITHUB_ENV"
 
       - name: Resolve pinned Electron version (cache key)
         id: electron-version
@@ -292,7 +332,8 @@ jobs:
       # Runs the invariant harness against the REAL data layer (read-back
       # verified) + static source scans. A single failing invariant fails this
       # step, so the build never reaches the publish step. The report is uploaded
-      # below so the board can be read WITHOUT logs.
+      # below so the board can be read WITHOUT logs. Runs in BOTH dry-run and
+      # real modes — it's verification, not publishing.
       - name: Verify invariants (release gate)
         run: npm run verify
 
@@ -303,8 +344,59 @@ jobs:
           name: verification-report-${{ matrix.os }}
           path: VERIFICATION-REPORT.md
 
+      # ── EXISTING-RELEASE GUARD — runs in BOTH modes (dry run reports only;
+      # a real run fails closed). Prevents ever silently overwriting or
+      # altering an already-published public release for this version. `gh`
+      # ships preinstalled on every GitHub-hosted runner image (Windows +
+      # macOS alike), so no extra setup is needed.
+      - name: Check for an existing public release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${PRIVATE_REF}"
+          if gh release view "${tag}" --repo AXON-APP2026/MANDEM-AI-releases >/dev/null 2>&1; then
+            echo "RELEASE_EXISTS=true" >> "$GITHUB_ENV"
+            echo "A public release for ${tag} already exists."
+            if [ "${DRY_RUN}" != "true" ]; then
+              echo "::error::Refusing to publish: a public release ${tag} already exists on AXON-APP2026/MANDEM-AI-releases. This workflow never overwrites, modifies, or adds assets to an existing release — bump to a new version if this is intentional."
+              exit 1
+            fi
+            echo "Dry run — reporting only; no release will be created or altered."
+          else
+            echo "RELEASE_EXISTS=false" >> "$GITHUB_ENV"
+            echo "No existing public release for ${tag}."
+          fi
+
+      # ── DURABLE PROVENANCE EVIDENCE — written to the job summary (not just
+      # the step log) so it survives as readable, discoverable release
+      # evidence per OS leg, without needing to open raw logs. No secrets.
+      - name: Record provenance in job summary
+        shell: bash
+        run: |
+          {
+            echo "### Release provenance — ${{ matrix.os }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Private repository | AXON-APP2026/MANDEM-AI |"
+            echo "| Private tag | \`${PRIVATE_REF}\` |"
+            echo "| Expected SHA | \`${EXPECTED_SHA}\` |"
+            echo "| Actual checked-out SHA | \`${ACTUAL_SHA}\` |"
+            echo "| SHA verification | PASS (actual == expected) |"
+            echo "| Application version | \`${APP_VERSION}\` |"
+            echo "| OS matrix leg | \`${{ matrix.os }}\` |"
+            echo "| Dry run | \`${DRY_RUN}\` |"
+            echo "| Existing public release for this version | \`${RELEASE_EXISTS}\` |"
+            echo "| Workflow run ID | \`${{ github.run_id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Signing/notarisation/publishing below this line are REAL-RUN ONLY —
+      # every one of these three steps carries an explicit dry_run guard, so
+      # a dry run cannot reach any of them regardless of what else happens.
       - name: Import Apple certificate (macOS only)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-latest' && inputs.dry_run == false
         run: |
           echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
           echo "CSC_LINK=$RUNNER_TEMP/cert.p12" >> $GITHUB_ENV
@@ -313,6 +405,9 @@ jobs:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
+      # The production application build itself is explicitly ALLOWED in a
+      # dry run (it's verification that the source builds, not publishing),
+      # so this step stays unconditional.
       - name: Build renderer (vite)
         shell: bash
         run: npm run build
@@ -334,7 +429,7 @@ jobs:
       # automatic GITHUB_TOKEN can create releases in THIS public repo
       # (contents: write above). electron-builder reads the target owner/repo
       # from package.json `publish` (AXON-APP2026/MANDEM-AI-releases), which is
-      # exactly this repo.
+      # exactly this repo. REAL-RUN ONLY — see the dry_run guard below.
       #
       # KNOWN RISK (release-provenance sprint, 25/09/2026) — this step still
       # publishes PER OS, independently: whichever matrix leg reaches here
@@ -345,6 +440,7 @@ jobs:
       # that needs: build) has been reported separately but is NOT applied
       # here — see the release-provenance report for the exact diff.
       - name: Package with electron-builder (and publish)
+        if: inputs.dry_run == false
         shell: bash
         run: npx electron-builder --publish always
         env:
@@ -353,3 +449,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Dry run complete
+        if: inputs.dry_run == true
+        shell: bash
+        run: echo "Dry run complete for ${{ matrix.os }} — provenance verified, source built. No signing, notarisation, or publishing occurred. See the job summary for the full provenance record."
