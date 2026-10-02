@@ -101,15 +101,27 @@ jobs:
       NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "15000"
       NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "120000"
       NPM_CONFIG_FETCH_TIMEOUT: "300000"
-      # Fixed, OS-agnostic-in-YAML cache locations for the Electron binary
-      # download (`electron` package postinstall) and electron-builder's own
-      # auxiliary tool downloads (nsis, winCodeSign, etc.). runner.temp already
-      # resolves to a real per-OS writable path (incl. Windows), so no manual
-      # per-OS branching is needed here — only the cache step below needs to
-      # know the OS, for the cache key.
-      ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
-      ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
     steps:
+      # ── CACHE-DIRECTORY RESOLUTION (parse-defect fix, round 3, 02/10/2026) ──
+      # The `runner` context is NOT available inside job-level `env:` (only
+      # within `steps` — see https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability).
+      # The previous job-level `ELECTRON_CACHE: ${{ runner.temp }}/...` lines
+      # failed to parse at all (confirmed via actionlint AND GitHub's own
+      # workflow_dispatch API, which rejected the file outright with
+      # "Unrecognized named-value: 'runner'") — this was a pre-existing defect,
+      # not something this correction introduced; it blocked every run since
+      # it was added. Fixed by resolving these paths in an ordinary step
+      # instead, using $RUNNER_TEMP — the equivalent real environment variable
+      # the runner itself always sets — and writing the result to $GITHUB_ENV
+      # so every later step (including the cache step's own `with:` block,
+      # via the `env` context) still sees ELECTRON_CACHE / ELECTRON_BUILDER_CACHE
+      # exactly as before.
+      - name: Resolve cache directories
+        shell: bash
+        run: |
+          echo "ELECTRON_CACHE=${RUNNER_TEMP}/electron-cache" >> "$GITHUB_ENV"
+          echo "ELECTRON_BUILDER_CACHE=${RUNNER_TEMP}/electron-builder-cache" >> "$GITHUB_ENV"
+
       # ── INPUT VALIDATION — fails closed before anything else runs. A
       # malformed/abbreviated/branch-like value never reaches checkout.
       - name: Validate release inputs
