@@ -59,6 +59,11 @@ on:
         required: true
         default: true
         type: boolean
+      macos_validation_only:
+        description: "false (default). true: runs ONLY the macOS leg, performs real Developer ID signing and notarisation against the requested tag, but NEVER publishes (electron-builder --publish never) regardless of dry_run — proves the macOS signing/notarisation route works without creating or touching any GitHub Release. The Windows leg is skipped entirely."
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write # needed to create the GitHub Release in THIS repo (real runs only)
@@ -72,11 +77,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Computes which OS legs `build` actually runs. A job-level `if:` cannot
+  # reference `matrix.*` (confirmed via actionlint — "context matrix is not
+  # allowed here"), so excluding Windows entirely when macos_validation_only
+  # is true means computing the matrix list itself, the standard GitHub
+  # Actions pattern for a conditional matrix (build.strategy.matrix.os below
+  # reads this job's output via fromJSON).
+  determine_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      os_list: ${{ steps.compute.outputs.os_list }}
+    steps:
+      - name: Compute OS matrix
+        id: compute
+        shell: bash
+        env:
+          MACOS_VALIDATION_ONLY: ${{ inputs.macos_validation_only }}
+        run: |
+          set -euo pipefail
+          if [ "${MACOS_VALIDATION_ONLY}" = "true" ]; then
+            echo 'os_list=["macos-latest"]' >> "$GITHUB_OUTPUT"
+            echo "macOS validation run: Windows leg excluded entirely."
+          else
+            echo 'os_list=["macos-latest","windows-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: determine_matrix
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.determine_matrix.outputs.os_list) }}
     runs-on: ${{ matrix.os }}
     env:
       # Workflow inputs, bound to env vars ONCE here so every later `run:`
@@ -90,6 +121,7 @@ jobs:
       PRIVATE_REF: ${{ inputs.ref }}
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       DRY_RUN: ${{ inputs.dry_run }}
+      MACOS_VALIDATION_ONLY: ${{ inputs.macos_validation_only }}
       # Explicit + bounded, never infinite. These govern npm's OWN registry
       # fetches (package metadata + tarballs) — Electron's binary download is a
       # separate HTTP request the `electron` package's postinstall makes via
@@ -141,9 +173,13 @@ jobs:
             echo "::error::Invalid dry_run value '${DRY_RUN}' — expected true or false."
             exit 1
           fi
+          if [ "${MACOS_VALIDATION_ONLY}" != "true" ] && [ "${MACOS_VALIDATION_ONLY}" != "false" ]; then
+            echo "::error::Invalid macos_validation_only value '${MACOS_VALIDATION_ONLY}' — expected true or false."
+            exit 1
+          fi
           # Normalise the SHA to lowercase for every later comparison.
           echo "EXPECTED_SHA=${sha_lc}" >> "$GITHUB_ENV"
-          echo "Validated: ref=${PRIVATE_REF} expected_sha=${sha_lc} dry_run=${DRY_RUN}"
+          echo "Validated: ref=${PRIVATE_REF} expected_sha=${sha_lc} dry_run=${DRY_RUN} macos_validation_only=${MACOS_VALIDATION_ONLY}"
 
       # Pull the PRIVATE application source AT THE EXACT TAG being released —
       # never a moving branch. actions/checkout itself fails this step
@@ -398,11 +434,16 @@ jobs:
           if gh release view "${tag}" --repo AXON-APP2026/MANDEM-AI-releases >/dev/null 2>&1; then
             echo "RELEASE_EXISTS=true" >> "$GITHUB_ENV"
             echo "A public release for ${tag} already exists."
-            if [ "${DRY_RUN}" != "true" ]; then
+            # macos_validation_only NEVER publishes (electron-builder is
+            # invoked with --publish never regardless of this guard), so an
+            # existing release for this tag is expected and never refused —
+            # only a REAL run (dry_run:false, not validation-only) fails
+            # closed here.
+            if [ "${DRY_RUN}" != "true" ] && [ "${MACOS_VALIDATION_ONLY}" != "true" ]; then
               echo "::error::Refusing to publish: a public release ${tag} already exists on AXON-APP2026/MANDEM-AI-releases. This workflow never overwrites, modifies, or adds assets to an existing release — bump to a new version if this is intentional."
               exit 1
             fi
-            echo "Dry run — reporting only; no release will be created or altered."
+            echo "Dry run or macOS-validation-only — reporting only; no release will be created or altered."
           else
             echo "RELEASE_EXISTS=false" >> "$GITHUB_ENV"
             echo "No existing public release for ${tag}."
@@ -427,19 +468,83 @@ jobs:
             echo "| Application version | \`${APP_VERSION}\` |"
             echo "| OS matrix leg | \`${{ matrix.os }}\` |"
             echo "| Dry run | \`${DRY_RUN}\` |"
+            echo "| macOS validation only | \`${MACOS_VALIDATION_ONLY}\` |"
             echo "| Existing public release for this version | \`${RELEASE_EXISTS}\` |"
             echo "| Workflow run ID | \`${{ github.run_id }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Signing/notarisation/publishing below this line are REAL-RUN ONLY —
-      # every one of these three steps carries an explicit dry_run guard, so
-      # a dry run cannot reach any of them regardless of what else happens.
+      # Signing/notarisation below this line run on a REAL run OR a macOS
+      # validation run (never a plain dry run) — every guarded step checks
+      # `inputs.dry_run == false || inputs.macos_validation_only == true`.
+      # Publishing itself (the actual GitHub Release upload) remains
+      # impossible in validation mode regardless: the packaging step below
+      # switches to `electron-builder --publish never` whenever
+      # macos_validation_only is true, so signing/notarisation run for real
+      # but nothing is ever uploaded.
+      # ── macOS SIGNING FIX (round 6, macOS release-failure diagnosis) ───────
+      # ROOT CAUSE (proven from the real v0.11.2 release run's job log, not
+      # guessed): electron-builder's OWN automatic keychain path — triggered
+      # whenever CSC_LINK/CSC_KEY_PASSWORD are set — creates a temporary
+      # keychain with a freshly random password (createKeychain(), in
+      # app-builder-lib/out/codeSign/macCodeSign.js), but then calls
+      # `security set-key-partition-list -k <password>` using the CERTIFICATE
+      # password (CSC_KEY_PASSWORD / APPLE_CERTIFICATE_PASSWORD) instead of
+      # that keychain's own random password (importCerts(), same file) — a
+      # confirmed electron-builder bug, not a wrong/expired/missing secret:
+      # the certificate itself decoded and imported successfully (the
+      # `security import` call immediately before it never failed), only the
+      # mismatched-password partition-list call did, with the real error
+      # "security: SecKeychainUnlock: The user name or passphrase you
+      # entered is not correct."
+      #
+      # FIX: do the keychain creation/import/partition-list OURSELVES, with
+      # ONE password we generate and use consistently for every step, then
+      # hand electron-builder that already-prepared keychain via CSC_KEYCHAIN
+      # (never CSC_LINK/CSC_KEY_PASSWORD) — electron-builder's own
+      # MacPackager.codeSigningInfo (macPackager.js) skips createKeychain()
+      # entirely whenever getCscLink() returns null, and instead uses
+      # `process.env.CSC_KEYCHAIN` directly for identity discovery
+      # (findIdentity) and signing (signAsync({ keychain: ... })) — this is a
+      # normal, electron-builder-documented "bring your own keychain" path,
+      # not a second competing certificate-import mechanism: CSC_LINK is
+      # simply never set, so electron-builder's automatic path is never
+      # invoked at all.
       - name: Import Apple certificate (macOS only)
-        if: matrix.os == 'macos-latest' && inputs.dry_run == false
+        if: matrix.os == 'macos-latest' && (inputs.dry_run == false || inputs.macos_validation_only == true)
+        shell: bash
         run: |
-          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
-          echo "CSC_LINK=$RUNNER_TEMP/cert.p12" >> $GITHUB_ENV
-          echo "CSC_KEY_PASSWORD=$APPLE_CERTIFICATE_PASSWORD" >> $GITHUB_ENV
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          # Same password used to CREATE/UNLOCK this keychain above (never
+          # the certificate password) — this exact line is the fix: using
+          # the keychain's own password here is what electron-builder's
+          # internal call gets wrong.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          EXISTING_KEYCHAINS="$(security list-keychains -d user | sed 's/^ *"//; s/" *$//')"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $EXISTING_KEYCHAINS
+
+          rm -f "$CERT_PATH"
+
+          echo "CSC_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "Certificate imported into a dedicated temporary keychain (not electron-builder's own automatic CSC_LINK path)."
+
+          identity_line="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep 'Developer ID Application' | head -1 || true)"
+          if [ -z "$identity_line" ]; then
+            echo "::error::No 'Developer ID Application' signing identity with an accessible private key was found in the imported certificate. The certificate or its private key is the problem — this is NOT a workflow configuration issue."
+            exit 1
+          fi
+          echo "Signing identity present: ${identity_line#*) }"
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -478,10 +583,22 @@ jobs:
       # fix (build both OSes to artifacts, publish once in a separate job
       # that needs: build) has been reported separately but is NOT applied
       # here — see the release-provenance report for the exact diff.
+      # macos_validation_only builds, signs AND notarises exactly like a real
+      # run (notarize:true in package.json's build.mac config runs inside
+      # electron-builder's own afterSign step, regardless of --publish) —
+      # --publish never only skips the upload-to-GitHub-Release step, so
+      # publishing stays impossible in validation mode no matter what else
+      # is true.
       - name: Package with electron-builder (and publish)
-        if: inputs.dry_run == false
+        if: inputs.dry_run == false || inputs.macos_validation_only == true
         shell: bash
-        run: npx electron-builder --publish always
+        run: |
+          set -euo pipefail
+          if [ "${MACOS_VALIDATION_ONLY}" = "true" ]; then
+            npx electron-builder --publish never
+          else
+            npx electron-builder --publish always
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # macOS code-signing + notarisation (no-op on Windows).
@@ -489,7 +606,69 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
+      # ── macOS VALIDATION EVIDENCE — proves signing/notarisation actually
+      # happened (never trusts electron-builder's own exit code alone): reads
+      # back the real signed .app with codesign/spctl, same two-hard-
+      # constraints discipline as the application's own invariant harness.
+      # No certificate/credential material is ever printed — only identity
+      # name, team ID and codesign/spctl's own PASS/FAIL text.
+      - name: Verify macOS signing and notarisation (validation only)
+        if: matrix.os == 'macos-latest' && inputs.macos_validation_only == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find release -maxdepth 2 -name '*.app' -print -quit)"
+          if [ -z "${APP_PATH}" ]; then
+            echo "::error::No packaged .app found under release/ — packaging did not produce an application bundle."
+            exit 1
+          fi
+          echo "Validating: ${APP_PATH}"
+
+          {
+            echo "### macOS signing/notarisation validation"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if codesign --verify --deep --strict --verbose=2 "${APP_PATH}" 2> /tmp/codesign.log; then
+            echo "| codesign --verify --deep --strict | PASS |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| codesign --verify --deep --strict | FAIL |" >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/codesign.log
+            echo "::error::codesign verification failed — see the step log above."
+            exit 1
+          fi
+
+          SIGNING_INFO="$(codesign -dvv "${APP_PATH}" 2>&1 || true)"
+          IDENTITY="$(printf '%s\n' "${SIGNING_INFO}" | grep '^Authority=' | head -1 | sed 's/^Authority=//')"
+          TEAM_ID="$(printf '%s\n' "${SIGNING_INFO}" | grep '^TeamIdentifier=' | head -1 | sed 's/^TeamIdentifier=//')"
+          RUNTIME_FLAG="$(printf '%s\n' "${SIGNING_INFO}" | grep '^Flags=' | head -1)"
+          echo "| Signing identity | \`${IDENTITY}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Team identifier | \`${TEAM_ID}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Hardened runtime (codesign flags) | \`${RUNTIME_FLAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+          if spctl --assess --type execute --verbose=2 "${APP_PATH}" 2> /tmp/spctl.log; then
+            echo "| spctl --assess --type execute | PASS |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| spctl --assess --type execute | FAIL |" >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/spctl.log
+            echo "::error::spctl assessment failed — the app is signed but Gatekeeper rejects it (notarisation likely did not complete/staple)."
+            exit 1
+          fi
+          cat /tmp/spctl.log
+
+          if xcrun stapler validate "${APP_PATH}" 2> /tmp/staple.log; then
+            echo "| stapler validate | PASS |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| stapler validate | INCONCLUSIVE (non-fatal — spctl already confirmed Gatekeeper acceptance) |" >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/staple.log
+          fi
+
+          echo "| Published | NO — --publish never; no GitHub Release created or modified |" >> "$GITHUB_STEP_SUMMARY"
+          echo "macOS signing and notarisation validated successfully. Nothing was published."
+
       - name: Dry run complete
-        if: inputs.dry_run == true
+        if: inputs.dry_run == true && inputs.macos_validation_only == false
         shell: bash
         run: echo "Dry run complete for ${{ matrix.os }} — provenance verified, source built. No signing, notarisation, or publishing occurred. See the job summary for the full provenance record."
