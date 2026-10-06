@@ -640,13 +640,19 @@ jobs:
             exit 1
           fi
 
+          # These three fields are informational only (job-summary display) —
+          # never the signing/notarisation gate, which is the separate
+          # codesign/spctl/stapler checks around them. `grep` returning no
+          # match (its normal "not found" exit status, not an error) must
+          # not kill this step under `set -euo pipefail`, so each pipeline is
+          # explicitly allowed to produce an empty value via `|| true`.
           SIGNING_INFO="$(codesign -dvv "${APP_PATH}" 2>&1 || true)"
-          IDENTITY="$(printf '%s\n' "${SIGNING_INFO}" | grep '^Authority=' | head -1 | sed 's/^Authority=//')"
-          TEAM_ID="$(printf '%s\n' "${SIGNING_INFO}" | grep '^TeamIdentifier=' | head -1 | sed 's/^TeamIdentifier=//')"
-          RUNTIME_FLAG="$(printf '%s\n' "${SIGNING_INFO}" | grep '^Flags=' | head -1)"
-          echo "| Signing identity | \`${IDENTITY}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Team identifier | \`${TEAM_ID}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Hardened runtime (codesign flags) | \`${RUNTIME_FLAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          IDENTITY="$(printf '%s\n' "${SIGNING_INFO}" | grep '^Authority=' | head -1 | sed 's/^Authority=//' || true)"
+          TEAM_ID="$(printf '%s\n' "${SIGNING_INFO}" | grep '^TeamIdentifier=' | head -1 | sed 's/^TeamIdentifier=//' || true)"
+          RUNTIME_FLAG="$(printf '%s\n' "${SIGNING_INFO}" | grep '^Flags=' | head -1 || true)"
+          echo "| Signing identity | \`${IDENTITY:-Not reported}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Team identifier | \`${TEAM_ID:-Not reported}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Hardened runtime (codesign flags) | \`${RUNTIME_FLAG:-Not reported}\` |" >> "$GITHUB_STEP_SUMMARY"
 
           if spctl --assess --type execute --verbose=2 "${APP_PATH}" 2> /tmp/spctl.log; then
             echo "| spctl --assess --type execute | PASS |" >> "$GITHUB_STEP_SUMMARY"
